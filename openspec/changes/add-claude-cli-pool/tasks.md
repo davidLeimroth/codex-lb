@@ -1,0 +1,14 @@
+## Tasks
+- [x] Implement CLI worker and protocol adapters.
+- [x] Write tests for authentication (including account-scoped `.oauth-token`), streaming, tool round trips, history, errors, cancellation (including disconnect before first output), capacity, extra-usage refusal and limited-key settlement.
+- [x] Review through Claude CLI Opus 5.5 and apply the actionable findings in the working tree.
+- [x] Record in-band model-source stream failures (Chat error frames, Responses `error`/`response.failed`/errored `response.incomplete`) as request-log errors, settling reported usage once on the passthrough and buffered limited-key paths.
+- [x] Cancel model-source Chat and Responses upstream requests when the client disconnects before a response starts (stream header wait, non-streaming generation, limited-key buffering), releasing the reservation and logging `cancelled`, with ASGI disconnect tests against a cancellable upstream.
+- [x] Parent verification of the disconnect fix: run the new disconnect tests, lint and types, and regenerate `patches/claude-source-stream-errors.patch`.
+- [x] Parent verification: targeted tests, lint and types pass. The new capability and change pass strict OpenSpec validation. Full inherited specs have 22 existing strict-validation failures; recorded without unrelated edits.
+- [x] Confirm the served model IDs (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5`) against the real Claude CLI.
+- [x] Confirm the pinned Claude CLI sha256 build arguments against the official 2.1.283 release manifest, build both `Dockerfile.claude` targets, and run `tests/integration/test_claude_messages.py` against the pinned runtime base.
+- [x] Disable paid extra usage on every subscription account used by the worker.
+- [x] Push one fork customization commit and record the upstream pin/update procedure (procedure drafted in `context.md`).
+- [x] Deploy authenticated cluster workers and verify real subscription calls through codex-lb.
+- [ ] Promote the cancellation-fixed immutable images; repeat public disconnect checks and verify the real dsh harness in the cluster.

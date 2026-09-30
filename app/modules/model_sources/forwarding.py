@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from functools import partial
 from json import JSONDecodeError
 from math import isfinite
 from typing import cast
@@ -95,6 +96,10 @@ class SourceChatStream:
     body: AsyncIterator[bytes]
     usage_holder: "SourceUsageHolder"
     upstream_status_code: int
+    # Releases the upstream response and session lease. ``body`` does this
+    # itself once iterated, but closing a never-iterated async generator skips
+    # its ``finally``, so a caller discarding an unconsumed stream uses this.
+    close: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,12 +107,17 @@ class SourceResponsesStream:
     body: AsyncIterator[bytes]
     usage_holder: "SourceUsageHolder"
     upstream_status_code: int
+    # See ``SourceChatStream.close``.
+    close: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass(slots=True)
 class SourceUsageHolder:
     usage: SourceUsage | None = None
     timings: SourceTimings | None = None
+    # First terminal in-band failure (``{"error": {...}}``, redacted) reported
+    # after the 200 status line. The frame itself still reaches the client.
+    error: dict[str, JsonValue] | None = None
 
 
 async def _await_cleanup_deferring_cancellation(awaitable: Awaitable[object]) -> None:
@@ -198,8 +208,18 @@ async def stream_chat_completion(
     encryptor: TokenEncryptor | None = None,
 ) -> SourceChatStream:
     usage_holder = SourceUsageHolder()
-    usage_parser = SourceStreamUsageParser(usage_holder, response_shape="chat")
+    usage_parser = SourceStreamUsageParser(
+        usage_holder,
+        response_shape="chat",
+        redact_error=partial(_redact_source_error_payload, source=source, encryptor=encryptor),
+    )
     stack, response = await _open_source_stream(source, "/chat/completions", payload, encryptor=encryptor)
+
+    async def close() -> None:
+        # A plain ``async with stack`` unwinds unshielded: repeated
+        # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
+        # leak the pooled HTTP session lease. Closing twice is a no-op.
+        await _await_cleanup_deferring_cancellation(stack.aclose())
 
     async def body() -> AsyncIterator[bytes]:
         try:
@@ -207,12 +227,14 @@ async def stream_chat_completion(
                 usage_parser.feed(chunk)
                 yield chunk
         finally:
-            # A plain ``async with stack`` unwinds unshielded: repeated
-            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
-            # leak the pooled HTTP session lease.
-            await _await_cleanup_deferring_cancellation(stack.aclose())
+            await close()
 
-    return SourceChatStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
+    return SourceChatStream(
+        body=body(),
+        usage_holder=usage_holder,
+        upstream_status_code=response.status,
+        close=close,
+    )
 
 
 async def forward_responses(
@@ -350,8 +372,16 @@ async def stream_responses(
     encryptor: TokenEncryptor | None = None,
 ) -> SourceResponsesStream:
     usage_holder = SourceUsageHolder()
-    usage_parser = SourceStreamUsageParser(usage_holder, response_shape="responses")
+    usage_parser = SourceStreamUsageParser(
+        usage_holder,
+        response_shape="responses",
+        redact_error=partial(_redact_source_error_payload, source=source, encryptor=encryptor),
+    )
     stack, response = await _open_source_stream(source, "/responses", payload, encryptor=encryptor)
+
+    async def close() -> None:
+        # See ``stream_chat_completion``.
+        await _await_cleanup_deferring_cancellation(stack.aclose())
 
     async def body() -> AsyncIterator[bytes]:
         try:
@@ -359,12 +389,14 @@ async def stream_responses(
                 usage_parser.feed(chunk)
                 yield chunk
         finally:
-            # A plain ``async with stack`` unwinds unshielded: repeated
-            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
-            # leak the pooled HTTP session lease.
-            await _await_cleanup_deferring_cancellation(stack.aclose())
+            await close()
 
-    return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
+    return SourceResponsesStream(
+        body=body(),
+        usage_holder=usage_holder,
+        upstream_status_code=response.status,
+        close=close,
+    )
 
 
 async def _open_source_stream(
@@ -742,9 +774,16 @@ class SourceStreamUsageParser:
     # parser must not buffer the whole stream in memory.
     _MAX_BUFFER_CHARS = 1_048_576
 
-    def __init__(self, usage_holder: SourceUsageHolder, *, response_shape: str) -> None:
+    def __init__(
+        self,
+        usage_holder: SourceUsageHolder,
+        *,
+        response_shape: str,
+        redact_error: Callable[[dict[str, JsonValue]], dict[str, JsonValue]] | None = None,
+    ) -> None:
         self._usage_holder = usage_holder
         self._response_shape = response_shape
+        self._redact_error = redact_error
         self._buffer = ""
 
     def feed(self, chunk: bytes) -> None:
@@ -775,13 +814,59 @@ class SourceStreamUsageParser:
             if self._response_shape == "responses":
                 usage = _usage_from_responses_event(parsed)
                 timings = _timings_from_responses_event(parsed)
+                error = _error_from_responses_event(parsed)
             else:
                 usage = _usage_from_chat_payload(parsed)
                 timings = _timings_from_payload(parsed)
+                error = _error_from_chat_chunk(parsed)
             if usage is not None:
                 self._usage_holder.usage = usage
             if timings is not None:
                 self._usage_holder.timings = timings
+            if error is not None and self._usage_holder.error is None:
+                self._usage_holder.error = self._redact_error(error) if self._redact_error is not None else error
+
+
+def _error_from_chat_chunk(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """Recognize an in-band Chat Completions stream error frame (``{"error": ...}``)."""
+    error = payload.get("error")
+    if is_json_mapping(error):
+        return {"error": dict(error)}
+    if isinstance(error, str) and error:
+        return {"error": {"message": error, "type": "upstream_error", "code": "model_source_stream_error"}}
+    return None
+
+
+def _error_from_responses_event(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """Recognize a terminal Responses stream failure.
+
+    ``error`` events and ``response.failed`` are failures. ``response.incomplete``
+    is a normal terminal (for example ``max_output_tokens``) unless the
+    response also carries an ``error`` object.
+    """
+    event_type = payload.get("type")
+    if event_type == "error":
+        nested = payload.get("error")
+        if is_json_mapping(nested):
+            return {"error": dict(nested)}
+        return {"error": {key: payload[key] for key in ("code", "message", "param") if payload.get(key) is not None}}
+    response = payload.get("response")
+    response_error = response.get("error") if is_json_mapping(response) else None
+    if event_type == "response.failed":
+        if is_json_mapping(response_error):
+            return {"error": dict(response_error)}
+        return {
+            "error": {
+                "message": "OpenAI-compatible model source response failed",
+                "type": "upstream_error",
+                "code": "response_failed",
+            }
+        }
+    if event_type == "response.incomplete" and is_json_mapping(response_error):
+        return {"error": dict(response_error)}
+    if event_type is None:
+        return _error_from_chat_chunk(payload)
+    return None
 
 
 def _usage_from_responses_event(payload: Mapping[str, JsonValue]) -> SourceUsage | None:

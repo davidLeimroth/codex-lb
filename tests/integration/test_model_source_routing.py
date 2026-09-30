@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from tempfile import SpooledTemporaryFile
-from typing import TypeAlias, cast
+from typing import Any, TypeAlias, cast
 
 import pytest
 import starlette.formparsers as starlette_formparsers
@@ -3547,3 +3548,797 @@ async def test_source_embeddings_without_usage_fails_closed_for_limited_key(asyn
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "usage_unavailable"
+
+
+def _sse_frames_handler(frames: bytes) -> _UpstreamHandler:
+    async def handler(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(frames)
+        await response.write_eof()
+        return response
+
+    return handler
+
+
+async def _create_source_stream_key(async_client, *, name: str, source_id: str, limited: bool) -> tuple[str, str]:
+    body: dict[str, object] = {"name": name, "assignedSourceIds": [source_id]}
+    if limited:
+        body["limits"] = [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000}]
+    created = await async_client.post("/api/api-keys/", json=body)
+    assert created.status_code == 200
+    return created.json()["key"], created.json()["id"]
+
+
+async def _assert_source_stream_outcome(
+    key_id: str,
+    *,
+    limited: bool,
+    status: str,
+    error_code: str | None,
+    error_message: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    counted_tokens: int,
+) -> None:
+    async with SessionLocal() as session:
+        [log] = (await session.execute(select(RequestLog).where(RequestLog.api_key_id == key_id))).scalars().all()
+        assert (log.status, log.error_code, log.error_message) == (status, error_code, error_message)
+        assert (log.input_tokens, log.output_tokens) == (input_tokens, output_tokens)
+        reserved = select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.status == "reserved")
+        assert (await session.execute(reserved)).scalars().all() == []
+        if limited:
+            [limit] = await ApiKeysRepository(session).get_limits_by_key(key_id)
+            assert limit.current_value == counted_tokens
+
+
+_CHAT_IN_BAND_ERROR_FRAMES = (
+    b'data: {"id":"chatcmpl_err","object":"chat.completion.chunk","choices":'
+    b'[{"index":0,"delta":{"content":"par"},"finish_reason":null}]}\n\n'
+    b'data: {"id":"chatcmpl_err","object":"chat.completion.chunk","choices":[],'
+    b'"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}\n\n'
+    b'data: {"error":{"message":"worker crashed","type":"server_error","code":"worker_crashed"}}\n\n'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limited", [False, True], ids=["unlimited", "limited-buffered"])
+async def test_source_chat_stream_in_band_error_settles_usage_and_logs_error(async_client, source_upstream, limited):
+    await _enable_api_key_auth(async_client)
+    base_url = await source_upstream(_sse_frames_handler(_CHAT_IN_BAND_ERROR_FRAMES))
+    model = "source-chat-in-band-error"
+    source_id = await _create_model_source(async_client, name="chat-in-band-error", model=model, base_url=base_url)
+    key, key_id = await _create_source_stream_key(
+        async_client, name="chat-in-band-error-key", source_id=source_id, limited=limited
+    )
+
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        received = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    # The in-band error still reaches the client; the reported usage is settled
+    # and the request is logged as an error, not a success.
+    assert b'"code":"worker_crashed"' in received
+    assert b'"content":"par"' in received
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=limited,
+        status="error",
+        error_code="worker_crashed",
+        error_message="worker crashed",
+        input_tokens=9,
+        output_tokens=2,
+        counted_tokens=11,
+    )
+
+
+@pytest.mark.asyncio
+async def test_limited_source_chat_stream_in_band_error_without_usage_releases(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    frames = (
+        b'data: {"id":"chatcmpl_err","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{"content":"par"},"finish_reason":null}]}\n\n'
+        b'data: {"error":{"message":"worker crashed","type":"server_error","code":"worker_crashed"}}\n\n'
+    )
+    base_url = await source_upstream(_sse_frames_handler(frames))
+    model = "source-chat-in-band-error-no-usage"
+    source_id = await _create_model_source(
+        async_client, name="chat-in-band-error-no-usage", model=model, base_url=base_url
+    )
+    key, key_id = await _create_source_stream_key(
+        async_client, name="chat-in-band-error-no-usage-key", source_id=source_id, limited=True
+    )
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "worker_crashed"
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=True,
+        status="error",
+        error_code="worker_crashed",
+        error_message="worker crashed",
+        input_tokens=None,
+        output_tokens=None,
+        counted_tokens=0,
+    )
+
+
+_RESPONSES_FAILED_FRAMES = (
+    b'data: {"type":"response.created","response":{"id":"resp_fail","object":"response",'
+    b'"status":"in_progress","output":[]}}\n\n'
+    b'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,'
+    b'"content_index":0,"delta":"par"}\n\n'
+    b'data: {"type":"response.failed","response":{"id":"resp_fail","object":"response","status":"failed",'
+    b'"error":{"code":"server_error","message":"worker crashed"},'
+    b'"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n'
+)
+
+_RESPONSES_INCOMPLETE_FRAMES = (
+    b'data: {"type":"response.created","response":{"id":"resp_cut","object":"response",'
+    b'"status":"in_progress","output":[]}}\n\n'
+    b'data: {"type":"response.incomplete","response":{"id":"resp_cut","object":"response",'
+    b'"status":"incomplete","error":null,"incomplete_details":{"reason":"max_output_tokens"},'
+    b'"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limited", [False, True], ids=["unlimited", "limited-buffered"])
+@pytest.mark.parametrize(
+    ("frames", "status", "error_code", "error_message"),
+    [
+        (_RESPONSES_FAILED_FRAMES, "error", "server_error", "worker crashed"),
+        (_RESPONSES_INCOMPLETE_FRAMES, "success", None, None),
+    ],
+    ids=["failed", "incomplete"],
+)
+async def test_source_responses_stream_terminal_settles_usage_and_classifies_log(
+    async_client,
+    source_upstream,
+    limited,
+    frames,
+    status,
+    error_code,
+    error_message,
+):
+    await _enable_api_key_auth(async_client)
+    base_url = await source_upstream(_sse_frames_handler(frames))
+    model = "source-responses-terminal"
+    source_id = await _create_model_source(
+        async_client,
+        name="responses-terminal",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    key, key_id = await _create_source_stream_key(
+        async_client, name="responses-terminal-key", source_id=source_id, limited=limited
+    )
+
+    async with async_client.stream(
+        "POST",
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "instructions": "hi", "input": [], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        received = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    # ``response.failed`` is forwarded and logged as an error; a
+    # ``response.incomplete`` truncation without an error object is a success.
+    assert frames.split(b"\n\n")[-2] in received
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=limited,
+        status=status,
+        error_code=error_code,
+        error_message=error_message,
+        input_tokens=7,
+        output_tokens=3,
+        counted_tokens=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_limited_source_stream_transport_failure_settles_partial_usage(
+    async_client, source_upstream, monkeypatch
+):
+    import aiohttp
+
+    import app.modules.proxy.api as proxy_api
+    from app.modules.model_sources.forwarding import SourceChatStream, SourceUsage, SourceUsageHolder
+
+    await _enable_api_key_auth(async_client)
+
+    async def unused_upstream(_request: web.Request) -> web.Response:
+        raise AssertionError("the source stream is replaced in this test")
+
+    base_url = await source_upstream(unused_upstream)
+    model = "source-transport-failure"
+    source_id = await _create_model_source(async_client, name="transport-failure", model=model, base_url=base_url)
+    key, key_id = await _create_source_stream_key(
+        async_client, name="transport-failure-key", source_id=source_id, limited=True
+    )
+
+    async def failing_stream(_source: object, _payload: object, **_kwargs: object) -> SourceChatStream:
+        usage_holder = SourceUsageHolder()
+
+        async def body() -> AsyncIterator[bytes]:
+            usage_holder.usage = SourceUsage(input_tokens=4, output_tokens=1)
+            yield b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+
+        return SourceChatStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
+
+    monkeypatch.setattr(proxy_api, "stream_source_chat_completion", failing_stream)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "model_source_stream_error"
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=True,
+        status="error",
+        error_code="model_source_stream_error",
+        error_message="ClientPayloadError",
+        input_tokens=4,
+        output_tokens=1,
+        counted_tokens=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_stream_transport_failure_settles_partial_usage_once(monkeypatch: pytest.MonkeyPatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsage, SourceUsageHolder
+
+    settled: list[tuple[object, object]] = []
+    released: list[object] = []
+    logs: list[dict[str, object]] = []
+
+    async def settle(reservation: object, **kwargs: object) -> bool:
+        settled.append((reservation, kwargs["usage"]))
+        return True
+
+    async def record_release(reservation: object) -> None:
+        released.append(reservation)
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
+    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    usage_holder = SourceUsageHolder()
+
+    async def source_stream() -> AsyncIterator[bytes]:
+        usage_holder.usage = SourceUsage(input_tokens=4, output_tokens=1)
+        yield b"data: usage\n\n"
+        raise RuntimeError("connection reset")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_stream_transport_failure",
+        name="stream-transport-failure",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_stream_transport_failure",
+        key_id="key_stream_transport_failure",
+        model="stream-transport-failure",
+    )
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        async for _chunk in proxy_api._source_chat_stream_with_settlement(
+            source_stream(),
+            usage_holder=usage_holder,
+            request=request,
+            source=source,
+            api_key=None,
+            model="stream-transport-failure",
+            reservation=reservation,
+        ):
+            pass
+
+    assert settled == [(reservation, usage_holder.usage)]
+    assert released == []
+    assert logs[-1]["status"] == "error"
+    assert logs[-1]["error_code"] == "model_source_stream_error"
+    assert logs[-1]["usage"] == usage_holder.usage
+
+
+class _HeldUpstream:
+    """Source upstream that holds every request open until the proxy abandons it.
+
+    Served with ``handler_cancellation=True``: a proxy that closes its
+    connection cancels the handler, which is how the tests observe the
+    upstream request going away.
+    """
+
+    def __init__(self, *, head: bytes | None = None) -> None:
+        # ``head`` is written after 200 SSE headers; ``None`` holds the headers too.
+        self._head = head
+        self.active = 0
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def handler(self, request: web.Request) -> web.StreamResponse:
+        await request.read()
+        self.active += 1
+        try:
+            if self._head is not None:
+                response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+                await response.prepare(request)
+                await response.write(self._head)
+            self.started.set()
+            await asyncio.sleep(3600)
+        finally:
+            self.active -= 1
+            self.closed.set()
+        raise AssertionError("held source request was never cancelled")
+
+
+@pytest.fixture
+async def held_source_upstream() -> AsyncIterator[Callable[[_HeldUpstream], Awaitable[str]]]:
+    runners: list[web.AppRunner] = []
+
+    async def start(upstream: _HeldUpstream) -> str:
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", upstream.handler)
+        runner = web.AppRunner(app, handler_cancellation=True)
+        await runner.setup()
+        port = _free_port()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+        runners.append(runner)
+        return f"http://127.0.0.1:{port}/v1"
+
+    yield start
+
+    for runner in runners:
+        await runner.cleanup()
+
+
+class _DisconnectingClient:
+    """Drive the ASGI app like a server whose client leaves mid-request.
+
+    ``receive`` delivers the whole body once, then blocks until
+    ``disconnect()`` and reports ``http.disconnect`` from then on, matching
+    uvicorn. Nothing cancels the app task, just as a real server does not
+    cancel a handler that has not started its response.
+    """
+
+    def __init__(self, app: Any, path: str, *, key: str, body: dict[str, object]) -> None:
+        raw_body = json.dumps(body).encode()
+        self.sent: list[dict[str, Any]] = []
+        self._disconnected = asyncio.Event()
+        self._body_sent = False
+        self._raw_body = raw_body
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "root_path": "",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"testserver"),
+                (b"authorization", f"Bearer {key}".encode()),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(raw_body)).encode()),
+            ],
+            "client": ("127.0.0.1", 50123),
+            "server": ("testserver", 80),
+        }
+        self.task: asyncio.Task[None] = asyncio.create_task(app(scope, self._receive, self._send))
+
+    async def _receive(self) -> dict[str, object]:
+        if not self._body_sent:
+            self._body_sent = True
+            return {"type": "http.request", "body": self._raw_body, "more_body": False}
+        await self._disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        self.sent.append(message)
+
+    def disconnect(self) -> None:
+        self._disconnected.set()
+
+    def response_statuses(self) -> list[int]:
+        return [message["status"] for message in self.sent if message["type"] == "http.response.start"]
+
+
+def _source_disconnect_request(route: str, model: str, *, stream: bool) -> tuple[str, dict[str, object]]:
+    if route == "chat":
+        return "/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        }
+    return "/v1/responses", {"model": model, "instructions": "hi", "input": [], "stream": stream}
+
+
+async def _reserved_reservation_count() -> int:
+    async with SessionLocal() as session:
+        reserved = select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.status == "reserved")
+        return len((await session.execute(reserved)).scalars().all())
+
+
+async def _disconnect_and_assert_upstream_closed(client: _DisconnectingClient, upstream: _HeldUpstream) -> None:
+    try:
+        client.disconnect()
+        # Well under the source timeout: the upstream request must go away
+        # because the client left, not because anything timed out.
+        await asyncio.wait_for(upstream.closed.wait(), timeout=2)
+        await asyncio.wait_for(client.task, timeout=5)
+    finally:
+        if not client.task.done():
+            client.task.cancel()
+    assert upstream.active == 0
+    # The handler finishes with an undelivered 499 rather than an error; the
+    # middleware may skip even that start message for a departed client.
+    assert set(client.response_statuses()) <= {499}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limited", [False, True], ids=["unlimited", "limited"])
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "json"])
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_source_request_disconnect_before_upstream_headers_cancels_upstream(
+    async_client,
+    app_instance,
+    held_source_upstream,
+    route,
+    stream,
+    limited,
+):
+    await _enable_api_key_auth(async_client)
+    upstream = _HeldUpstream()
+    base_url = await held_source_upstream(upstream)
+    model = "source-held-headers"
+    source_id = await _create_model_source(
+        async_client,
+        name="held-headers",
+        model=model,
+        base_url=base_url,
+        supports_responses=route == "responses",
+    )
+    key, key_id = await _create_source_stream_key(
+        async_client, name="held-headers-key", source_id=source_id, limited=limited
+    )
+    path, body = _source_disconnect_request(route, model, stream=stream)
+
+    client = _DisconnectingClient(app_instance, path, key=key, body=body)
+    try:
+        await asyncio.wait_for(upstream.started.wait(), timeout=10)
+    except BaseException:
+        client.task.cancel()
+        raise
+    if limited:
+        assert await _reserved_reservation_count() == 1
+
+    await _disconnect_and_assert_upstream_closed(client, upstream)
+
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=limited,
+        status="cancelled",
+        error_code="client_disconnected",
+        error_message=(
+            "client disconnected during source stream setup" if stream else "client disconnected during source request"
+        ),
+        input_tokens=None,
+        output_tokens=None,
+        counted_tokens=0,
+    )
+
+
+_HELD_STREAM_HEADS = {
+    "chat": (
+        b'data: {"id":"chatcmpl_held","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{"content":"par"},"finish_reason":null}]}\n\n'
+    ),
+    "responses": (
+        b"event: response.created\n"
+        b'data: {"type":"response.created","response":{"id":"resp_held","status":"in_progress"}}\n\n'
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_limited_source_stream_disconnect_while_buffering_cancels_upstream(
+    async_client,
+    app_instance,
+    held_source_upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    route,
+):
+    import app.modules.proxy.api as proxy_api
+
+    buffering = asyncio.Event()
+    buffer_stream = proxy_api._buffer_limited_source_stream
+
+    async def observed_buffer(stream: AsyncIterator[bytes]) -> tuple[list[bytes], bool]:
+        buffering.set()
+        return await buffer_stream(stream)
+
+    monkeypatch.setattr(proxy_api, "_buffer_limited_source_stream", observed_buffer)
+
+    await _enable_api_key_auth(async_client)
+    # Headers and a first frame arrive, then the source stalls before usage.
+    upstream = _HeldUpstream(head=_HELD_STREAM_HEADS[route])
+    base_url = await held_source_upstream(upstream)
+    model = "source-held-buffering"
+    source_id = await _create_model_source(
+        async_client,
+        name="held-buffering",
+        model=model,
+        base_url=base_url,
+        supports_responses=route == "responses",
+    )
+    key, key_id = await _create_source_stream_key(
+        async_client, name="held-buffering-key", source_id=source_id, limited=True
+    )
+    path, body = _source_disconnect_request(route, model, stream=True)
+
+    client = _DisconnectingClient(app_instance, path, key=key, body=body)
+    try:
+        await asyncio.wait_for(upstream.started.wait(), timeout=10)
+        await asyncio.wait_for(buffering.wait(), timeout=10)
+    except BaseException:
+        client.task.cancel()
+        raise
+    # Limited keys buffer for accounting: nothing has reached the client yet.
+    assert client.sent == []
+    assert await _reserved_reservation_count() == 1
+
+    await _disconnect_and_assert_upstream_closed(client, upstream)
+
+    await _assert_source_stream_outcome(
+        key_id,
+        limited=True,
+        status="cancelled",
+        error_code="client_disconnected",
+        error_message="client disconnected during source stream buffering",
+        input_tokens=None,
+        output_tokens=None,
+        counted_tokens=0,
+    )
+
+
+def _receive_request(receive: Callable[[], Awaitable[dict[str, object]]]):
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        },
+        receive,
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_work_result_racing_disconnect_is_discarded() -> None:
+    import app.modules.proxy.api as proxy_api
+
+    work_cancelled = asyncio.Event()
+    discarded: list[object] = []
+
+    async def disconnected() -> dict[str, object]:
+        await asyncio.sleep(0)
+        return {"type": "http.disconnect"}
+
+    async def stream_opened_despite_cancellation() -> str:
+        # Models an upstream stream that finished opening just as the
+        # disconnect was handled: the opened stream must still be released.
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            work_cancelled.set()
+        return "opened-stream"
+
+    async def discard(result: object) -> None:
+        discarded.append(result)
+
+    with pytest.raises(proxy_api._SourceClientDisconnectedError):
+        await proxy_api._await_source_work_until_disconnect(
+            _receive_request(disconnected),
+            stream_opened_despite_cancellation(),
+            discard=discard,
+        )
+
+    assert work_cancelled.is_set()
+    assert discarded == ["opened-stream"]
+
+
+@pytest.mark.asyncio
+async def test_source_stream_opened_alongside_immediate_disconnect_is_discarded() -> None:
+    import app.modules.proxy.api as proxy_api
+    from app.modules.model_sources.forwarding import SourceChatStream, SourceUsageHolder
+
+    upstream_closes: list[str] = []
+
+    async def disconnected() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"data: never-delivered\n\n"
+
+    async def close() -> None:
+        upstream_closes.append("closed")
+
+    stream = SourceChatStream(
+        body=body(),
+        usage_holder=SourceUsageHolder(),
+        upstream_status_code=200,
+        close=close,
+    )
+
+    async def stream_opened() -> SourceChatStream:
+        return stream
+
+    # Setup and the disconnect watch both finish in the same loop turn, so the
+    # work is already done when the disconnect is seen: the opened stream must
+    # be released rather than handed to a handler whose client is gone.
+    with pytest.raises(proxy_api._SourceClientDisconnectedError):
+        await proxy_api._await_source_work_until_disconnect(
+            _receive_request(disconnected),
+            stream_opened(),
+            discard=proxy_api._discard_source_stream,
+        )
+
+    assert upstream_closes == ["closed"]
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream.body)
+
+
+@pytest.mark.asyncio
+async def test_source_json_result_alongside_immediate_disconnect_is_returned() -> None:
+    import app.modules.proxy.api as proxy_api
+
+    async def disconnected() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def completed_work() -> str:
+        return "completion"
+
+    # Without ``discard`` the completed upstream work carries usage to settle.
+    result = await proxy_api._await_source_work_until_disconnect(
+        _receive_request(disconnected),
+        completed_work(),
+    )
+
+    assert result == "completion"
+
+
+@pytest.mark.asyncio
+async def test_source_work_returns_result_that_completes_before_disconnect() -> None:
+    import app.modules.proxy.api as proxy_api
+
+    client_left = asyncio.Event()
+    discarded: list[object] = []
+
+    async def receive() -> dict[str, object]:
+        await client_left.wait()
+        return {"type": "http.disconnect"}
+
+    async def completed_work() -> str:
+        return "completion"
+
+    async def discard(result: object) -> None:
+        discarded.append(result)
+
+    result = await proxy_api._await_source_work_until_disconnect(
+        _receive_request(receive),
+        completed_work(),
+        discard=discard,
+    )
+
+    # Completed upstream work is handed back for settlement, never discarded.
+    assert result == "completion"
+    assert discarded == []
+
+
+@pytest.mark.asyncio
+async def test_source_work_caller_cancellation_cancels_work_and_propagates() -> None:
+    import app.modules.proxy.api as proxy_api
+
+    work_started = asyncio.Event()
+    work_cancelled = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    async def held_work() -> str:
+        work_started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            work_cancelled.set()
+            raise
+        return "unreachable"
+
+    task = asyncio.create_task(
+        proxy_api._await_source_work_until_disconnect(_receive_request(receive), held_work())
+    )
+    await asyncio.wait_for(work_started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert work_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_source_stream_close_releases_upstream(async_client, held_source_upstream) -> None:
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import stream_chat_completion
+
+    del async_client  # app lifespan owns the shared HTTP client lease
+    upstream = _HeldUpstream(head=b": held\n\n")
+    base_url = await held_source_upstream(upstream)
+    source = ModelSource(
+        id="src_unconsumed_close",
+        name="unconsumed-close",
+        kind="openai_compatible",
+        base_url=base_url,
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+
+    stream = await stream_chat_completion(source, {"model": "m", "messages": [], "stream": True})
+    await asyncio.wait_for(upstream.started.wait(), timeout=5)
+    assert stream.close is not None
+    # ``body`` was never iterated, so ``body.aclose()`` alone would skip its
+    # teardown and leave the upstream response and session lease open.
+    await stream.close()
+    await asyncio.wait_for(upstream.closed.wait(), timeout=2)
+    assert upstream.active == 0
+    await stream.close()  # idempotent

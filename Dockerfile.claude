@@ -1,0 +1,45 @@
+# Preserve the verified native-thread fixes already running in this cluster.
+FROM ghcr.io/davidleimroth/talos/codex-lb@sha256:6c3a557e326d5b761723d7f26c9b298977125996491a44e83a26b20460cf4f82 AS runtime
+COPY --chown=app:app patches/claude-source-stream-errors.patch /tmp/claude-source-stream-errors.patch
+COPY --chown=app:app scripts/apply-claude-runtime-patch.py /tmp/apply-claude-runtime-patch.py
+RUN python /tmp/apply-claude-runtime-patch.py && rm /tmp/claude-source-stream-errors.patch /tmp/apply-claude-runtime-patch.py
+COPY --chown=app:app app/modules/claude_messages /app/app/modules/claude_messages
+COPY --chown=app:app app/claude_entrypoint.py /app/app/claude_entrypoint.py
+COPY --chmod=755 scripts/claude-entrypoint.sh /app/scripts/claude-entrypoint.sh
+# Fail the build, not the primary proxy's startup, if the pinned runtime drifted from what the adapter calls.
+RUN python -m app.modules.claude_messages.compat
+CMD ["/app/scripts/claude-entrypoint.sh"]
+
+FROM runtime AS worker-base
+USER root
+ARG CLAUDE_CODE_VERSION=2.1.283
+# sha256 of each platform binary, copied from the official release manifest when bumping the version:
+# https://downloads.claude.ai/claude-code-releases/$CLAUDE_CODE_VERSION/manifest.json (platforms.<p>.checksum).
+# Pinned here rather than trusted from a manifest fetched from the same origin at build time.
+ARG CLAUDE_CODE_SHA256_LINUX_X64=1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2
+ARG CLAUDE_CODE_SHA256_LINUX_ARM64=346d294f0103d6fc0de11ac953579b5c62dfa90698a4cfc486b6f927c615e697
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+        amd64) platform=linux-x64; expected="${CLAUDE_CODE_SHA256_LINUX_X64:-}" ;; \
+        arm64) platform=linux-arm64; expected="${CLAUDE_CODE_SHA256_LINUX_ARM64:-}" ;; \
+        *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    case "$expected" in \
+        ""|*[!0-9a-f]*) echo "set a lowercase hex sha256 build arg for $platform $CLAUDE_CODE_VERSION" >&2; exit 1 ;; \
+    esac; \
+    [ "${#expected}" -eq 64 ] || { echo "sha256 for $platform must be 64 hex characters" >&2; exit 1; }; \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libstdc++6; \
+    curl -fsSL "https://downloads.claude.ai/claude-code-releases/$CLAUDE_CODE_VERSION/$platform/claude" \
+        -o /usr/local/bin/claude; \
+    echo "$expected  /usr/local/bin/claude" | sha256sum -c -; \
+    chmod 755 /usr/local/bin/claude; \
+    apt-get purge -y --auto-remove curl; rm -rf /var/lib/apt/lists/*
+USER app
+RUN claude --version
+EXPOSE 2456
+
+FROM worker-base AS worker
+COPY --chown=app:app app/modules/claude_cli /app/app/modules/claude_cli
+RUN python -c "import app.modules.claude_cli.bridge, app.modules.claude_cli.mcp"
+CMD ["python", "-m", "uvicorn", "app.modules.claude_cli.bridge:app", "--host", "0.0.0.0", "--port", "2456", "--no-access-log"]

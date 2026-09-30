@@ -282,3 +282,95 @@ def test_responses_stream_usage_parser_captures_nested_response_metrics() -> Non
     assert holder.timings is not None
     assert holder.timings.latency_first_token_ms == 50
     assert holder.timings.latency_ms == 150
+
+
+def test_chat_stream_parser_records_first_in_band_error_and_keeps_usage() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="chat")
+
+    parser.feed(b'data: {"choices":[],"usage":{"prompt_tokens":18,"completion_tokens":2}}\n\n')
+    parser.feed(b'data: {"error":{"message":"boom","type":"claude_cli_error","code":"claude_cli_error"}}\n\n')
+    parser.feed(b'data: {"error":{"message":"later","code":"other"}}\n\n')
+
+    assert holder.usage is not None
+    assert holder.usage.output_tokens == 2
+    assert holder.error == {"error": {"message": "boom", "type": "claude_cli_error", "code": "claude_cli_error"}}
+
+
+def test_chat_stream_parser_ignores_null_error_field() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="chat")
+
+    parser.feed(b'data: {"choices":[{"delta":{"content":"hi"}}],"error":null}\n\n')
+
+    assert holder.error is None
+
+
+def test_responses_stream_parser_records_failed_response_with_usage() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="responses")
+
+    parser.feed(
+        b'data: {"type":"response.failed","response":{"status":"failed",'
+        b'"error":{"code":"server_error","message":"worker crashed"},'
+        b'"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'
+    )
+
+    assert holder.usage is not None
+    assert holder.usage.output_tokens == 3
+    assert holder.error == {"error": {"code": "server_error", "message": "worker crashed"}}
+
+
+def test_responses_stream_parser_records_error_event() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="responses")
+
+    parser.feed(b'data: {"type":"error","code":"rate_limited","message":"slow down","param":null}\n\n')
+
+    assert holder.error == {"error": {"code": "rate_limited", "message": "slow down"}}
+
+
+def test_responses_stream_parser_treats_plain_incomplete_as_non_error() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="responses")
+
+    parser.feed(
+        b'data: {"type":"response.incomplete","response":{"status":"incomplete","error":null,'
+        b'"incomplete_details":{"reason":"max_output_tokens"},'
+        b'"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'
+    )
+
+    assert holder.usage is not None
+    assert holder.error is None
+
+
+def test_responses_stream_parser_records_incomplete_with_error_object() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="responses")
+
+    parser.feed(
+        b'data: {"type":"response.incomplete","response":{"status":"incomplete",'
+        b'"error":{"code":"server_error","message":"stream aborted"}}}\n\n'
+    )
+
+    assert holder.error == {"error": {"code": "server_error", "message": "stream aborted"}}
+
+
+def test_stream_parser_redacts_recorded_error() -> None:
+    source = ModelSource(
+        id="src_stream_redact",
+        name="Stream redact",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:8000/v1",
+        api_key_encrypted=b"encrypted-source-key",
+    )
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(
+        holder,
+        response_shape="chat",
+        redact_error=lambda payload: _redact_source_error_payload(payload, source, encryptor=_fake_encryptor()),
+    )
+
+    parser.feed(b'data: {"error":{"message":"bad key source-secret-token","code":"auth"}}\n\n')
+
+    assert holder.error == {"error": {"message": "bad key [REDACTED]", "code": "auth"}}

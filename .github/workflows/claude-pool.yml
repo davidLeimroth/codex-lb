@@ -1,0 +1,75 @@
+name: Claude subscription pool
+on:
+  push:
+    branches: [codex/claude-subscriptions]
+  workflow_dispatch:
+concurrency:
+  group: claude-pool-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  packages: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify preserved-runtime patch matches tracked changes
+        run: git diff --full-index HEAD^ HEAD -- app/modules/model_sources/forwarding.py app/modules/proxy/api.py | diff - patches/claude-source-stream-errors.patch
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev
+      - run: uv run ruff check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py
+      - run: uv run ty check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py
+      - run: uv run pytest tests/integration/test_model_source_routing.py tests/integration/test_proxy_chat_completions.py tests/unit/test_model_sources_forwarding.py tests/unit/test_model_sources_service.py tests/unit/test_model_sources_catalog.py tests/unit/test_proxy_websocket_model_source_guard.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py -q
+  images:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [runtime, worker]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: davidleimroth
+          password: ${{ secrets.CLAUDE_BASE_PULL_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile.claude
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=claude-${{ matrix.target }}
+          cache-to: type=gha,scope=claude-${{ matrix.target }},mode=max
+          tags: ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/davidLeimroth/codex-lb
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Verify adapter inside pinned runtime
+        if: matrix.target == 'runtime'
+        run: |
+          docker run --rm --user 0 --entrypoint sh \
+            -v "$PWD/tests:/tmp/check/tests:ro" \
+            -v "$PWD/pyproject.toml:/tmp/check/pyproject.toml:ro" \
+            -w /tmp/check \
+            ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }} \
+            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified image
+        run: |
+          image="ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}"
+          docker push "$image" | tee /tmp/push.log
+          echo "${{ matrix.target }} $(sed -n 's/.*digest: \(sha256:[a-f0-9]*\).*/\1/p' /tmp/push.log)" >> "$GITHUB_STEP_SUMMARY"
