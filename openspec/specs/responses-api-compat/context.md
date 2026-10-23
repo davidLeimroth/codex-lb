@@ -257,3 +257,21 @@ OpenSpec change first.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
 - Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+## HTTP pins and session bridge admission
+
+The HTTP session bridge opens upstream WebSockets and can inject its retained
+continuation reference on repeated turns. Bridge admission must therefore honor
+the existing transport precedence before it can mutate the request. HTTP pins
+use ordinary streaming and its existing account ownership and settlement paths.
+
+For example, a native Codex key with `transport_policy_override=always_http` and
+automatic upstream transport sends both full-history turns over HTTP, without
+adding a bridge-owned `previous_response_id`. A client-supplied reference remains
+untouched. Explicit upstream WebSocket selection still wins, and unpinned smart
+requests retain bridge behavior. This does not repair invalid client references
+or change recovery semantics for requests that continue to use WebSockets.
+
+The preserved production image applies the same tracked source delta with exact
+context matching. Route regressions run against that image as well as the source
+checkout, since the pinned runtime carries other native continuity fixes.

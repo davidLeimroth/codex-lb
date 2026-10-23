@@ -45,7 +45,9 @@ from app.modules.proxy._service.support import (
     _LOCAL_ACCOUNT_CAP_ERROR_CODES,
     _account_capacity_wait_payload,
     _account_selection_recovery_sleep_seconds,
+    _effective_http_downstream_transport_policy,
     _request_log_client_fields,
+    _resolved_configured_stream_transport,
     _RetryableStreamError,
     _signal_propagated_capacity_startup_wait,
     _signal_propagated_responses_service_cleanup_ready,
@@ -84,7 +86,6 @@ from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_fa
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
-_HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT = "smart"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICIES = frozenset({"smart", "always_http", "always_websocket", "pinned"})
 
 logger = logging.getLogger(__name__)
@@ -182,28 +183,6 @@ def _verified_cross_transport_fresh_replay(
     if not responses_payload_is_account_neutral_fresh_replay(fresh_payload.to_replay_safety_payload()):
         return None
     return fresh_payload
-
-
-def _effective_http_downstream_transport_policy(
-    api_key: ApiKeyData | None,
-    dashboard_settings: Any,
-    base_settings: Any,
-) -> tuple[str, bool]:
-    override = getattr(api_key, "transport_policy_override", None) if api_key is not None else None
-    if override is not None:
-        return override, True
-    dashboard_policy = getattr(dashboard_settings, "http_downstream_transport_policy", None)
-    if isinstance(dashboard_policy, str) and dashboard_policy:
-        return dashboard_policy, False
-    base_policy = getattr(base_settings, "http_downstream_transport_policy", _HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT)
-    return base_policy, False
-
-
-def _resolved_configured_stream_transport(dashboard_settings: Any, base_settings: Any) -> tuple[str, bool]:
-    configured = getattr(dashboard_settings, "upstream_stream_transport", "default")
-    if configured == "default":
-        configured = getattr(base_settings, "upstream_stream_transport", "auto")
-    return configured, configured in ("http", "websocket")
 
 
 async def _iter_account_capacity_recovery_wait(

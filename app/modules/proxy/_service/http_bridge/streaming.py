@@ -163,11 +163,13 @@ from app.modules.proxy._service.support import (
     _account_selection_recovery_sleep_seconds_from_message,
     _DeferredAccountBackoffLifecycle,
     _DeferredAccountBackoffTracker,
+    _effective_http_downstream_transport_policy,
     _event_type_from_payload,
     _HTTPBridgeOwnerForward,
     _HTTPBridgeSession,
     _HTTPBridgeSessionKey,
     _is_local_account_cap_code,
+    _resolved_configured_stream_transport,
     _signal_propagated_capacity_startup_ready,
     _signal_propagated_capacity_startup_wait,
     _signal_propagated_responses_service_cleanup_ready,
@@ -929,7 +931,19 @@ class _HTTPBridgeStreamingMixin:
         capacity_startup_ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         dashboard_settings = await _service_get_settings_cache().get()
-        runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
+        app_settings = _service_get_settings()
+        runtime_config = _http_bridge_runtime_config(dashboard_settings, app_settings)
+        configured_transport, explicit_transport = _resolved_configured_stream_transport(
+            dashboard_settings, app_settings
+        )
+        policy, _override_applied = _effective_http_downstream_transport_policy(
+            api_key, dashboard_settings, app_settings
+        )
+        if runtime_config.enabled and (
+            configured_transport == "http" or (not explicit_transport and policy in ("always_http", "pinned"))
+        ):
+            logger.info("stream_responses bypassing http bridge for HTTP transport pin policy=%s", policy)
+            runtime_config = dataclasses.replace(runtime_config, enabled=False)
         request_id = ensure_request_id()
         self._raise_for_unsupported_input_image_references(payload)
         payload_size_estimate_bytes = len(
