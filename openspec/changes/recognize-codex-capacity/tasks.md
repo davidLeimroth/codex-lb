@@ -6,5 +6,7 @@
 
 ## 2. Release
 
-- [ ] 2.1 Complete current-head review and CI, merge the focused source PR.
+- [x] 2.1 Complete current-head review and CI, merge the focused source PR.
 - [ ] 2.2 Build the exact immutable image, qualify and deploy it, and verify live recovery.
+
+Release evidence and the remaining qualification blocker are recorded in [context.md](context.md).
