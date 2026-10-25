@@ -22,6 +22,7 @@ jobs:
         run: |
           git apply --reverse --check patches/claude-source-stream-errors.patch
           git apply --reverse --check patches/http-bridge-transport-policy.patch
+          git apply --reverse --check patches/codex-capacity.patch
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true

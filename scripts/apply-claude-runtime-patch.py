@@ -13,6 +13,7 @@ patch = (
 )
 index = 0
 allowed = {
+    "app/modules/proxy/helpers.py",
     "app/modules/model_sources/forwarding.py",
     "app/modules/proxy/api.py",
     "app/modules/proxy/_service/http_bridge/streaming.py",
