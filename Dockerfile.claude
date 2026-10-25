@@ -1,8 +1,13 @@
 # Preserve the verified native-thread fixes already running in this cluster.
 FROM ghcr.io/davidleimroth/talos/codex-lb@sha256:6c3a557e326d5b761723d7f26c9b298977125996491a44e83a26b20460cf4f82 AS runtime
 COPY --chown=app:app patches/claude-source-stream-errors.patch /tmp/claude-source-stream-errors.patch
+COPY --chown=app:app patches/http-bridge-transport-policy.patch /tmp/http-bridge-transport-policy.patch
+COPY --chown=app:app patches/codex-capacity.patch /tmp/codex-capacity.patch
 COPY --chown=app:app scripts/apply-claude-runtime-patch.py /tmp/apply-claude-runtime-patch.py
-RUN python /tmp/apply-claude-runtime-patch.py && rm /tmp/claude-source-stream-errors.patch /tmp/apply-claude-runtime-patch.py
+RUN python /tmp/apply-claude-runtime-patch.py \
+    && python /tmp/apply-claude-runtime-patch.py /tmp/http-bridge-transport-policy.patch \
+    && python /tmp/apply-claude-runtime-patch.py /tmp/codex-capacity.patch \
+    && rm /tmp/claude-source-stream-errors.patch /tmp/http-bridge-transport-policy.patch /tmp/codex-capacity.patch /tmp/apply-claude-runtime-patch.py
 COPY --chown=app:app app/modules/claude_messages /app/app/modules/claude_messages
 COPY --chown=app:app app/claude_entrypoint.py /app/app/claude_entrypoint.py
 COPY --chmod=755 scripts/claude-entrypoint.sh /app/scripts/claude-entrypoint.sh

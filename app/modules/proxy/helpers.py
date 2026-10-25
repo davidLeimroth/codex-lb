@@ -39,7 +39,7 @@ _QUOTA_CODES = frozenset({"insufficient_quota", "usage_not_included", "quota_exc
 _TRANSIENT_CODES = frozenset(
     {"server_error", "upstream_error", "stream_incomplete", "overloaded_error", "server_is_overloaded"}
 )
-_MODEL_CAPACITY_MESSAGE_MARKERS = ("selected model is at capacity",)
+_MODEL_CAPACITY_MESSAGE_MARKERS = ("selected model is at capacity", "codex is at capacity")
 
 
 def _is_account_model_unsupported_error(
