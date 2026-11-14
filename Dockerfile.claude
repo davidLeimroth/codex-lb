@@ -7,7 +7,7 @@ RUN /opt/venv/bin/python - <<'PY'
 from pathlib import Path
 import tomllib
 
-names = {"aiohttp", "anyio", "brotli", "certifi", "dnspython", "urllib3"}
+names = {"aiohttp", "anyio", "brotli", "certifi", "dnspython", "urllib3", "yarl"}
 packages = [p for p in tomllib.loads(Path("/tmp/runtime-security.lock").read_text())["package"] if p["name"] in names]
 assert len(packages) == len(names)
 Path("/tmp/runtime-security.txt").write_text("".join(
@@ -22,6 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && /opt/venv/bin/python -m ensurepip \
     && /opt/venv/bin/python -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes -r /tmp/runtime-security.txt \
+    && /opt/venv/bin/python -m pip check \
     && /opt/venv/bin/python -m pip uninstall -y pip \
     && /opt/venv/bin/python -c 'import importlib.metadata as m; from pathlib import Path; expected=[line.split(" ",1)[0].split("==") for line in Path("/tmp/runtime-security.txt").read_text().splitlines()]; assert all(m.version(name)==version for name,version in expected)' \
     && rm /tmp/runtime-security.lock /tmp/runtime-security.txt

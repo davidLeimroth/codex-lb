@@ -94,11 +94,10 @@ jobs:
           assert changed == {'core/utils/sse.py'}, changed
           print('All production Python sources preserved except the reviewed SSE cleanup fix')
           PY
-      - name: Enforce preserved runtime high-severity gate
-        if: matrix.target == 'runtime'
+      - name: Enforce preserved image high-severity gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
-          image-ref: ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }}
+          image-ref: ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
