@@ -90,8 +90,9 @@ async def inject_sse_keepalives(
             pending = None
             yield chunk
     finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
             try:
                 await pending
             except BaseException:

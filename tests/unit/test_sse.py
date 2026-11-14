@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -140,6 +141,84 @@ async def test_inject_sse_keepalives_cancels_idle_source_when_downstream_closes(
     await cast(Any, stream).aclose()
 
     assert source_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_error", [False, True], ids=["eof", "error"])
+async def test_inject_sse_keepalives_drains_completed_reader_on_close(upstream_error: bool):
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    unhandled: list[dict[str, Any]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    async def source() -> AsyncIterator[str]:
+        try:
+            await release.wait()
+            if upstream_error:
+                raise RuntimeError("upstream failed after heartbeat")
+        finally:
+            finished.set()
+        return
+        yield "unreachable"  # pragma: no cover
+
+    stream = inject_sse_keepalives(source(), 0.01)
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        assert await anext(stream) == SSE_KEEPALIVE_FRAME
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        await cast(Any, stream).aclose()
+        del stream
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_inject_sse_keepalives_preserves_upstream_error_after_heartbeat():
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        await release.wait()
+        finished.set()
+        raise RuntimeError("upstream failure")
+        yield "unreachable"  # pragma: no cover
+
+    stream = inject_sse_keepalives(source(), 0.01)
+    assert await anext(stream) == SSE_KEEPALIVE_FRAME
+    release.set()
+    await asyncio.wait_for(finished.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match="upstream failure"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_inject_sse_keepalives_preserves_consumer_cancellation():
+    read_started = asyncio.Event()
+    read_cancelled = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        read_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            read_cancelled.set()
+        yield "unreachable"  # pragma: no cover
+
+    async def consume() -> None:
+        async for _ in inject_sse_keepalives(source(), 0.01):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.wait_for(read_started.wait(), timeout=1)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert read_cancelled.is_set()
 
 
 @pytest.mark.asyncio
