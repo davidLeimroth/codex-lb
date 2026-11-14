@@ -1,13 +1,42 @@
+# syntax=docker/dockerfile:1.7
 # Preserve the verified native-thread fixes already running in this cluster.
 FROM ghcr.io/davidleimroth/talos/codex-lb@sha256:6c3a557e326d5b761723d7f26c9b298977125996491a44e83a26b20460cf4f82 AS runtime
+USER root
+COPY uv.lock /tmp/runtime-security.lock
+RUN /opt/venv/bin/python - <<'PY'
+from pathlib import Path
+import tomllib
+
+names = {"aiohttp", "anyio", "brotli", "certifi", "dnspython", "urllib3", "yarl"}
+packages = [p for p in tomllib.loads(Path("/tmp/runtime-security.lock").read_text())["package"] if p["name"] in names]
+assert len(packages) == len(names)
+Path("/tmp/runtime-security.txt").write_text("".join(
+    p["name"] + "==" + p["version"] + " " + " ".join("--hash=" + w["hash"] for w in p["wheels"]) + "\n"
+    for p in packages
+))
+PY
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
+        apt gzip libapt-pkg7.0 libpcre2-8-0 libsqlite3-0 libssl3t64 openssl openssl-provider-legacy perl-base zlib1g \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' zlib1g)" ge '1:1.3.dfsg+really1.3.1-1+deb13u1' \
+    && rm -rf /var/lib/apt/lists/* \
+    && /opt/venv/bin/python -m ensurepip \
+    && /opt/venv/bin/python -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes -r /tmp/runtime-security.txt \
+    && /opt/venv/bin/python -m pip check \
+    && /opt/venv/bin/python -m pip uninstall -y pip \
+    && /opt/venv/bin/python -c 'import importlib.metadata as m; from pathlib import Path; expected=[line.split(" ",1)[0].split("==") for line in Path("/tmp/runtime-security.txt").read_text().splitlines()]; assert all(m.version(name)==version for name,version in expected)' \
+    && rm /tmp/runtime-security.lock /tmp/runtime-security.txt
+USER app
 COPY --chown=app:app patches/claude-source-stream-errors.patch /tmp/claude-source-stream-errors.patch
 COPY --chown=app:app patches/http-bridge-transport-policy.patch /tmp/http-bridge-transport-policy.patch
 COPY --chown=app:app patches/codex-capacity.patch /tmp/codex-capacity.patch
+COPY --chown=app:app patches/sse-reader-cleanup.patch /tmp/sse-reader-cleanup.patch
 COPY --chown=app:app scripts/apply-claude-runtime-patch.py /tmp/apply-claude-runtime-patch.py
 RUN python /tmp/apply-claude-runtime-patch.py \
     && python /tmp/apply-claude-runtime-patch.py /tmp/http-bridge-transport-policy.patch \
     && python /tmp/apply-claude-runtime-patch.py /tmp/codex-capacity.patch \
-    && rm /tmp/claude-source-stream-errors.patch /tmp/http-bridge-transport-policy.patch /tmp/codex-capacity.patch /tmp/apply-claude-runtime-patch.py
+    && python /tmp/apply-claude-runtime-patch.py /tmp/sse-reader-cleanup.patch \
+    && rm /tmp/claude-source-stream-errors.patch /tmp/http-bridge-transport-policy.patch /tmp/codex-capacity.patch /tmp/sse-reader-cleanup.patch /tmp/apply-claude-runtime-patch.py
 COPY --chown=app:app app/modules/claude_messages /app/app/modules/claude_messages
 COPY --chown=app:app app/claude_entrypoint.py /app/app/claude_entrypoint.py
 COPY --chmod=755 scripts/claude-entrypoint.sh /app/scripts/claude-entrypoint.sh

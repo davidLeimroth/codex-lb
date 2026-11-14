@@ -23,10 +23,15 @@ jobs:
           git apply --reverse --check patches/claude-source-stream-errors.patch
           git apply --reverse --check patches/http-bridge-transport-policy.patch
           git apply --reverse --check patches/codex-capacity.patch
+          git apply --reverse --check patches/sse-reader-cleanup.patch
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev
+      - run: uv run ruff check app/core/utils/sse.py tests/unit/test_sse.py
+      - run: uv run ruff format --check app/core/utils/sse.py tests/unit/test_sse.py
+      - run: uv run ty check app/core/utils/sse.py
+      - run: uv run pytest tests/unit/test_sse.py -q
       - run: uv run ruff check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
       - run: uv run ruff format --check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
       - run: uv run ty check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py
@@ -71,7 +76,32 @@ jobs:
             -v "$PWD/pyproject.toml:/tmp/check/pyproject.toml:ro" \
             -w /tmp/check \
             ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }} \
-            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
+            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/unit/test_sse.py tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
+      - name: Verify production source preservation
+        if: matrix.target == 'runtime'
+        run: |
+          baseline=ghcr.io/davidleimroth/talos/codex-lb@sha256:f20de556d082c706c845b09780b21f7047649497ecf655ead0762c4afcef1c73
+          candidate=ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }}
+          inventory='import hashlib,json,pathlib; root=pathlib.Path("/app/app"); print(json.dumps({str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*.py")},sort_keys=True))'
+          docker run --rm --network none --entrypoint python "$baseline" -c "$inventory" > /tmp/baseline-source.json
+          docker run --rm --network none --entrypoint python "$candidate" -c "$inventory" > /tmp/candidate-source.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          baseline = json.loads(Path('/tmp/baseline-source.json').read_text())
+          candidate = json.loads(Path('/tmp/candidate-source.json').read_text())
+          changed = {p for p in baseline.keys() | candidate.keys() if baseline.get(p) != candidate.get(p)}
+          assert changed == {'core/utils/sse.py'}, changed
+          print('All production Python sources preserved except the reviewed SSE cleanup fix')
+          PY
+      - name: Enforce preserved image high-severity gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -79,7 +109,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish verified image
         if: github.event_name != 'pull_request'
+        shell: bash
         run: |
+          set -euo pipefail
           image="ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}"
           docker push "$image" | tee /tmp/push.log
-          echo "${{ matrix.target }} $(sed -n 's/.*digest: \(sha256:[a-f0-9]*\).*/\1/p' /tmp/push.log)" >> "$GITHUB_STEP_SUMMARY"
+          digest="$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' /tmp/push.log | tail -n1)"
+          test -n "$digest" || { echo "::error::no digest in push output"; exit 1; }
+          echo "${{ matrix.target }} $digest" >> "$GITHUB_STEP_SUMMARY"

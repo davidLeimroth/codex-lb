@@ -74,24 +74,23 @@ async def inject_sse_keepalives(
         while True:
             if pending is None:
                 pending = asyncio.create_task(_next_chunk(iterator))
-            try:
-                chunk = await asyncio.wait_for(
-                    asyncio.shield(pending),
-                    timeout=interval_seconds,
-                )
-            except asyncio.TimeoutError:
+            done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
+            if not done:
                 if on_keepalive is not None:
                     on_keepalive()
                 yield keepalive_frame
                 continue
+            try:
+                chunk = pending.result()
             except StopAsyncIteration:
                 pending = None
                 break
             pending = None
             yield chunk
     finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
             try:
                 await pending
             except BaseException:

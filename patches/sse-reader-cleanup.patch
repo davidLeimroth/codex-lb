@@ -1,0 +1,36 @@
+diff --git a/app/core/utils/sse.py b/app/core/utils/sse.py
+index f757856c83bd038b6aabc63900038fbe7559442e..408128df00634dd72abf360daf371c6248b826d2 100644
+--- a/app/core/utils/sse.py
++++ b/app/core/utils/sse.py
+@@ -74,24 +74,23 @@ async def inject_sse_keepalives(
+         while True:
+             if pending is None:
+                 pending = asyncio.create_task(_next_chunk(iterator))
+-            try:
+-                chunk = await asyncio.wait_for(
+-                    asyncio.shield(pending),
+-                    timeout=interval_seconds,
+-                )
+-            except asyncio.TimeoutError:
++            done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
++            if not done:
+                 if on_keepalive is not None:
+                     on_keepalive()
+                 yield keepalive_frame
+                 continue
++            try:
++                chunk = pending.result()
+             except StopAsyncIteration:
+                 pending = None
+                 break
+             pending = None
+             yield chunk
+     finally:
+-        if pending is not None and not pending.done():
+-            pending.cancel()
++        if pending is not None:
++            if not pending.done():
++                pending.cancel()
+             try:
+                 await pending
+             except BaseException:
