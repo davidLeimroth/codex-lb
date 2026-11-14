@@ -19,9 +19,13 @@ separate exact-context patch rather than replacing the proxy service modules.
 
 Release checks also found fixed HIGH CVEs in zlib1g and dnspython. The standard
 image adds zlib1g to its existing named security upgrades and locks dnspython to
-2.9.2. The preserved runtime upgrades only those two dependencies, verifies the
-Debian fixed-version minimum, installs the wheel by the uv.lock hash into the
-explicit /opt/venv interpreter, removes pip and restores USER app. The 590-file
+2.9.2. A scan of the actual preserved image also found inherited fixable High/Critical
+findings in apt, gzip, PCRE2, SQLite, OpenSSL, Perl, aiohttp, anyio, Brotli, certifi
+and urllib3. The runtime upgrades those named Debian packages and six named Python
+packages (including dnspython) to the existing uv.lock versions, with locked wheel
+hashes, no dependency resolution and the explicit /opt/venv interpreter. It removes
+pip and restores USER app. The image workflow applies the existing standard-image
+Trivy gate to this actual preserved runtime before publication. The 590-file
 application-source comparison excludes site-packages intentionally.
 
 Production promotion remains held. Talos policy at da7423e83cd1ebf27004de1b7f3de35d737ad11c
