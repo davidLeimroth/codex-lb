@@ -1,0 +1,4 @@
+- [x] Use native MCP tool names in serialized history and forced-tool instructions.
+- [x] Add focused API regressions including strict rejection of bare tool calls.
+- [ ] Pass focused checks, urgent Opus review, and one worker build.
+- [ ] Merge fork-only PR, deploy pinned worker, verify focused DSH Sonnet tool round trip.

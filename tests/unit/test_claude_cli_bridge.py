@@ -71,8 +71,9 @@ if "SCENARIO_MIDFAIL" in prompt:
 if "SCENARIO_SLOW" in prompt: time.sleep(1)
 if "SCENARIO_PARTIAL" in prompt: time.sleep(60)
 if "SCENARIO_TOOL" in prompt:
+    tool_name = ("" if "SCENARIO_BARE_TOOL" in prompt else "mcp__client__") + record["tools"][0]["name"]
     stream({{"type": "content_block_start", "index": 1, "content_block": {{"type": "tool_use", "id": "toolu_1",
-            "name": "mcp__client__get_weather", "input": {{}}}}}})
+            "name": tool_name, "input": {{}}}}}})
     for part in ('{{"city":', ' "Paris"}}'):
         delta = {{"type": "input_json_delta", "partial_json": part}}
         stream({{"type": "content_block_delta", "index": 1, "delta": delta}})
@@ -275,10 +276,59 @@ async def test_responses_history_serialized_into_transcript(client: AsyncClient,
     match = re.search(r"^<user-([0-9a-f]{12})>$", prompt, re.MULTILINE)
     assert match is not None
     nonce = match.group(1)
-    assert f'<tool_call-{nonce} id="call_1" name="get_weather">{{}}</tool_call-{nonce}>' in prompt
+    assert f'<tool_call-{nonce} id="call_1" name="mcp__client__get_weather">{{}}</tool_call-{nonce}>' in prompt
     assert f'<tool_result-{nonce} id="call_1">\nsunny\n</tool_result-{nonce}>' in prompt
     assert f"<user-{nonce}>\nWeather?\n</user-{nonce}>" in prompt
     assert str(record["system"]).startswith("Use tools.") and "must respond by calling" in str(record["system"])
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("name", ["get_weather", "mcp__client__get_weather"])
+async def test_replayed_and_forced_tool_names_use_native_namespace(
+    client: AsyncClient, records: Path, endpoint: str, name: str
+) -> None:
+    tool = {**WEATHER_TOOL, "name": name}
+    body: dict[str, Any] = {"model": "sonnet", "tool_choice": {"type": "function", "name": name}}
+    if endpoint == "/v1/chat/completions":
+        body["tools"] = [{"type": "function", "function": tool}]
+        body["tool_choice"] = {"type": "function", "function": {"name": name}}
+        body["messages"] = [
+            {"role": "user", "content": "SCENARIO_TOOL"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": name, "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+    else:
+        body["tools"] = [tool]
+        body["input"] = [
+            {"role": "user", "content": "SCENARIO_TOOL"},
+            {"type": "function_call", "call_id": "c1", "name": name, "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "sunny"},
+        ]
+    response = await client.post(endpoint, json=body)
+    assert response.status_code == 200
+    record = only_record(records)
+    assert f'name="mcp__client__{name}"' in record["prompt"]
+    assert f' name="{name}"' not in record["prompt"]
+    assert f"calling the tool mcp__client__{name}." in record["system"]
+    assert record["tools"][0]["name"] == name
+    data = response.json()
+    returned_name = (
+        data["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+        if endpoint == "/v1/chat/completions"
+        else data["output"][-1]["name"]
+    )
+    assert returned_name == name
+
+
+async def test_bare_cli_tool_is_still_rejected(client: AsyncClient) -> None:
+    response = await client.post(
+        "/v1/responses", json={"model": "sonnet", "input": "SCENARIO_TOOL SCENARIO_BARE_TOOL", "tools": [WEATHER_TOOL]}
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "claude_cli_unexpected_tool"
 
 
 async def test_required_tool_choice_without_tool_call_is_an_error(client: AsyncClient) -> None:
