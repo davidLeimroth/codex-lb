@@ -109,7 +109,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish verified image
         if: github.event_name != 'pull_request'
+        shell: bash
         run: |
+          set -euo pipefail
           image="ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}"
           docker push "$image" | tee /tmp/push.log
-          echo "${{ matrix.target }} $(sed -n 's/.*digest: \(sha256:[a-f0-9]*\).*/\1/p' /tmp/push.log)" >> "$GITHUB_STEP_SUMMARY"
+          digest="$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' /tmp/push.log | tail -n1)"
+          test -n "$digest" || { echo "::error::no digest in push output"; exit 1; }
+          echo "${{ matrix.target }} $digest" >> "$GITHUB_STEP_SUMMARY"

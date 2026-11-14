@@ -27,7 +27,9 @@ uv.lock versions, with locked wheel hashes, no dependency resolution and the exp
 /opt/venv interpreter. A pip check verifies dependency closure before removing pip
 and restoring USER app. The image workflow applies the existing standard-image
 Trivy gate to both actual preserved images before publication. Each amd64 image is
-loaded locally, tested and scanned, then pushed without rebuilding. The 590-file
+loaded locally and scanned; the runtime runs adapter regressions and both images
+run build-time import checks. The same images are pushed without rebuilding and
+push failures or missing published digests fail the job. The 590-file
 application-source comparison excludes site-packages intentionally.
 
 Production promotion remains held. Talos policy at da7423e83cd1ebf27004de1b7f3de35d737ad11c
