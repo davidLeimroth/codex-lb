@@ -46,6 +46,7 @@ from app.modules.proxy.work_admission import AdmissionLease
 
 logger = logging.getLogger(__name__)
 
+_HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT = "smart"
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE = re.compile(r"(?m)^[ \t]*<!--\s*-->[ \t]*(?:\r?\n|\Z)")
@@ -1740,3 +1741,25 @@ def _openai_error_envelope_from_response_failed_payload(
     if isinstance(resets_in, int | float):
         error_detail["resets_in_seconds"] = resets_in
     return envelope
+
+
+def _effective_http_downstream_transport_policy(
+    api_key: ApiKeyData | None,
+    dashboard_settings: Any,
+    base_settings: Any,
+) -> tuple[str, bool]:
+    override = getattr(api_key, "transport_policy_override", None) if api_key is not None else None
+    if override is not None:
+        return override, True
+    dashboard_policy = getattr(dashboard_settings, "http_downstream_transport_policy", None)
+    if isinstance(dashboard_policy, str) and dashboard_policy:
+        return dashboard_policy, False
+    base_policy = getattr(base_settings, "http_downstream_transport_policy", _HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT)
+    return base_policy, False
+
+
+def _resolved_configured_stream_transport(dashboard_settings: Any, base_settings: Any) -> tuple[str, bool]:
+    configured = getattr(dashboard_settings, "upstream_stream_transport", "default")
+    if configured == "default":
+        configured = getattr(base_settings, "upstream_stream_transport", "auto")
+    return configured, configured in ("http", "websocket")

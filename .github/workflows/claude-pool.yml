@@ -2,6 +2,8 @@ name: Claude subscription pool
 on:
   push:
     branches: [codex/claude-subscriptions]
+  pull_request:
+    branches: [codex/claude-subscriptions]
   workflow_dispatch:
 concurrency:
   group: claude-pool-${{ github.ref }}
@@ -17,11 +19,18 @@ jobs:
         with:
           fetch-depth: 2
       - name: Verify preserved-runtime patch matches tracked changes
-        run: git diff --full-index HEAD^ HEAD -- app/modules/model_sources/forwarding.py app/modules/proxy/api.py | diff - patches/claude-source-stream-errors.patch
+        run: |
+          git apply --reverse --check patches/claude-source-stream-errors.patch
+          git apply --reverse --check patches/http-bridge-transport-policy.patch
+          git apply --reverse --check patches/codex-capacity.patch
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev
+      - run: uv run ruff check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
+      - run: uv run ruff format --check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
+      - run: uv run ty check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py
+      - run: uv run pytest tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_proxy_responses.py tests/unit/test_http_bridge_safe_continuity.py -q
       - run: uv run ruff check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py
       - run: uv run ty check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py
       - run: uv run pytest tests/integration/test_model_source_routing.py tests/integration/test_proxy_chat_completions.py tests/unit/test_model_sources_forwarding.py tests/unit/test_model_sources_service.py tests/unit/test_model_sources_catalog.py tests/unit/test_proxy_websocket_model_source_guard.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py -q
@@ -62,13 +71,14 @@ jobs:
             -v "$PWD/pyproject.toml:/tmp/check/pyproject.toml:ro" \
             -w /tmp/check \
             ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }} \
-            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
+            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish verified image
+        if: github.event_name != 'pull_request'
         run: |
           image="ghcr.io/davidleimroth/codex-lb:claude-${{ matrix.target }}-${{ github.sha }}"
           docker push "$image" | tee /tmp/push.log

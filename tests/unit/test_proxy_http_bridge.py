@@ -4366,10 +4366,15 @@ async def test_http_bridge_malformed_tool_lifecycle_persists_unknown_manifest(
 
 
 @pytest.mark.parametrize(
-    ("upstream_code", "expected_retry_error_code"),
+    ("upstream_code", "expected_retry_error_code", "upstream_message"),
     [
-        ("invalid_request_error", "server_is_overloaded"),
-        ("rate_limit_exceeded", "rate_limit_exceeded"),
+        (
+            "invalid_request_error",
+            "server_is_overloaded",
+            "Selected model is at capacity. Please try a different model.",
+        ),
+        ("rate_limit_exceeded", "rate_limit_exceeded", "Selected model is at capacity. Please try a different model."),
+        ("turn_rate_limit_exceeded", "server_is_overloaded", "Codex is at capacity, please try again later"),
     ],
 )
 @pytest.mark.asyncio
@@ -4377,6 +4382,7 @@ async def test_http_bridge_model_capacity_waits_before_precreated_retry(
     monkeypatch: pytest.MonkeyPatch,
     upstream_code: str,
     expected_retry_error_code: str,
+    upstream_message: str,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     handle_stream_error = AsyncMock()
@@ -4422,7 +4428,7 @@ async def test_http_bridge_model_capacity_waits_before_precreated_retry(
                 "error": {
                     "type": "invalid_request_error",
                     "code": upstream_code,
-                    "message": "Selected model is at capacity. Please try a different model.",
+                    "message": upstream_message,
                 },
             },
             separators=(",", ":"),
@@ -4439,7 +4445,7 @@ async def test_http_bridge_model_capacity_waits_before_precreated_retry(
     assert keepalive["retry_after_seconds"] == 0
     reason = keepalive["reason"]
     assert isinstance(reason, str)
-    assert "Selected model is at capacity" in reason
+    assert upstream_message in reason
     handle_stream_error.assert_awaited_once()
     handle_call = handle_stream_error.await_args
     assert handle_call is not None
@@ -4908,9 +4914,18 @@ async def test_http_bridge_model_capacity_wait_skips_sleep_for_non_replayable_re
     retry_precreated.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("upstream_code", "upstream_message"),
+    [
+        ("invalid_request_error", "Selected model is at capacity. Please try a different model."),
+        ("turn_rate_limit_exceeded", "Codex is at capacity, please try again later"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_http_bridge_model_capacity_wait_does_not_delay_anchored_errors(
     monkeypatch: pytest.MonkeyPatch,
+    upstream_code: str,
+    upstream_message: str,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     retry_precreated = AsyncMock(return_value=True)
@@ -4951,8 +4966,8 @@ async def test_http_bridge_model_capacity_wait_does_not_delay_anchored_errors(
                 "status": 400,
                 "error": {
                     "type": "invalid_request_error",
-                    "code": "invalid_request_error",
-                    "message": "Selected model is at capacity. Please try a different model.",
+                    "code": upstream_code,
+                    "message": upstream_message,
                 },
             },
             separators=(",", ":"),
@@ -24066,7 +24081,9 @@ async def test_create_http_bridge_session_does_not_classify_post_selection_failu
 @pytest.mark.asyncio
 async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_previous_response_owner_misses(
     monkeypatch: pytest.MonkeyPatch,
+    db_setup: bool,
 ) -> None:
+    del db_setup
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     await service._pin_file_account("file_from_other_account", "acc-file")
     payload = proxy_service.ResponsesRequest.model_validate(

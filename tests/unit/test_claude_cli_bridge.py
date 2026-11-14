@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -147,7 +147,7 @@ def assert_dead(pid: object) -> None:
     raise AssertionError(f"process {pid} still alive")
 
 
-def sse_payloads(body: str) -> list[dict[str, object]]:
+def sse_payloads(body: str) -> list[dict[str, Any]]:
     lines = [line.removeprefix("data: ") for line in body.splitlines() if line.startswith("data: ")]
     return [json.loads(line) for line in lines if line != "[DONE]"]
 
@@ -202,14 +202,14 @@ async def test_chat_stream_returns_native_tool_call_and_kills_cli(client: AsyncC
     response = await client.post("/v1/chat/completions", json=body)
     assert response.status_code == 200 and response.text.endswith("data: [DONE]\n\n")
     chunks = sse_payloads(response.text)
-    deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]  # type: ignore[index]
+    deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
     assert "".join(d.get("content", "") for d in deltas) == "Hello"
     [call] = next(d["tool_calls"] for d in deltas if "tool_calls" in d)
     assert call == {"index": 0, "id": "toolu_1", "type": "function",
                     "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}  # fmt: skip
-    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"  # type: ignore[index]
+    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
     usage = chunks[-1]["usage"]  # stream usage: the CLI was killed before its result event
-    assert usage["prompt_tokens"] == 18 and usage["completion_tokens"] == 7  # type: ignore[index]
+    assert usage["prompt_tokens"] == 18 and usage["completion_tokens"] == 7
     record = only_record(records)
     assert record["tools"] == [{"name": "get_weather", "description": "", "inputSchema": {"type": "object"}}]
     assert_dead(record["pid"])
@@ -235,7 +235,10 @@ async def test_responses_stream_lifecycle_order(client: AsyncClient) -> None:
 
 async def test_codex_client_metadata_is_accepted_but_not_sent_to_cli(client: AsyncClient, records: Path) -> None:
     body = {
-        "model": "opus", "stream": True, "store": False, "input": "Hello from Codex",
+        "model": "opus",
+        "stream": True,
+        "store": False,
+        "input": "Hello from Codex",
         "client_metadata": {"x-codex-turn-metadata": "PRIVATE_CLIENT_SENTINEL", "nested": {"version": 155}},
     }
     response = await client.post("/v1/responses", json=body)
@@ -417,8 +420,8 @@ async def call_until_disconnect(app: FastAPI, path: str, body: dict[str, Any], a
 
     sent: list[dict[str, Any]] = []
 
-    async def send(message: dict[str, Any]) -> None:
-        sent.append(message)
+    async def send(message: MutableMapping[str, Any]) -> None:
+        sent.append(dict(message))
 
     headers = [(b"authorization", f"Bearer {API_KEY}".encode()), (b"content-type", b"application/json")]
     scope = {

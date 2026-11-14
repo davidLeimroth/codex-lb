@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
-patch = Path("/tmp/claude-source-stream-errors.patch").read_text().splitlines(keepends=True)
+patch = (
+    Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/claude-source-stream-errors.patch")
+    .read_text()
+    .splitlines(keepends=True)
+)
 index = 0
-allowed = {"app/modules/model_sources/forwarding.py", "app/modules/proxy/api.py"}
+allowed = {
+    "app/modules/proxy/helpers.py",
+    "app/modules/model_sources/forwarding.py",
+    "app/modules/proxy/api.py",
+    "app/modules/proxy/_service/http_bridge/streaming.py",
+    "app/modules/proxy/_service/streaming/retry.py",
+    "app/modules/proxy/_service/support.py",
+}
 while index < len(patch):
     if not patch[index].startswith("--- a/"):
         index += 1
@@ -40,4 +52,4 @@ while index < len(patch):
         at = candidates[0]
         lines[at : at + len(before)] = after
     path.write_text("".join(lines))
-    print(f"Applied Claude source stream delta to {name}")
+    print(f"Applied preserved runtime source delta to {name}")

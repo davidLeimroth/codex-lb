@@ -74,7 +74,7 @@ async def claude_source(async_client) -> AsyncIterator[Callable[[Handler], Await
         runners.append(runner)
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
-        port = site._server.sockets[0].getsockname()[1]
+        port = runner.addresses[0][1]
         response = await async_client.post(
             "/api/model-sources/",
             json={

@@ -4303,9 +4303,7 @@ async def test_source_work_caller_cancellation_cancels_work_and_propagates() -> 
             raise
         return "unreachable"
 
-    task = asyncio.create_task(
-        proxy_api._await_source_work_until_disconnect(_receive_request(receive), held_work())
-    )
+    task = asyncio.create_task(proxy_api._await_source_work_until_disconnect(_receive_request(receive), held_work()))
     await asyncio.wait_for(work_started.wait(), timeout=1)
     task.cancel()
 
