@@ -28,14 +28,16 @@ jobs:
           git apply --reverse --check patches/codex-capacity.patch
           git apply --reverse --check patches/sse-reader-cleanup.patch
           git apply --reverse --check patches/json-access-native-fields.patch
+          git apply --reverse --check patches/metrics-server-logging.patch
       - name: Select focused logging regression
         id: scope
         env:
           # Immutable candidate behind the reused adapter/worker test evidence.
-          VERIFIED_SHA: 06d624bd85d13adfbeea76eb87cbf6399551c030
+          VERIFIED_SHA: da123854bf1af1ad3c46037263aa606e704897c4
         run: |
           python - <<'PY'
           import json, os, re, subprocess
+          from pathlib import Path
           base = os.environ['VERIFIED_SHA']
           changed = set()
           if re.fullmatch(r'[0-9a-f]{40}', base) and base != '0' * 40:
@@ -43,13 +45,21 @@ jobs:
                   subprocess.run(['git', 'fetch', '--depth=1', 'origin', base], check=True)
               changed = set(subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', base, 'HEAD'], text=True).splitlines())
           logging_files = {
+              'app/main.py', 'tests/unit/test_metrics_server_logging.py', 'patches/metrics-server-logging.patch',
               'app/core/runtime_logging.py', 'tests/unit/test_json_access_logging.py',
               'patches/json-access-native-fields.patch', 'scripts/apply-claude-runtime-patch.py',
               'Dockerfile.claude', '.github/workflows/claude-pool.yml', '.github/workflows/ci.yml',
           }
           only_logging = bool(changed) and all(
-              p in logging_files or p.startswith('openspec/changes/fix-native-json-access/') for p in changed
+              p in logging_files or p.startswith(('openspec/changes/fix-native-json-access/', 'openspec/changes/fix-metrics-server-logging/')) for p in changed
           )
+          if 'app/main.py' in changed:
+              previous = subprocess.check_output(['git', 'show', base + ':app/main.py'], text=True)
+              before = '        config = uvicorn.Config(metrics_app, host="0.0.0.0", port=settings.metrics_port, log_level="warning")\n'
+              after = ('        config = uvicorn.Config(\n'
+                       '            metrics_app, host="0.0.0.0", port=settings.metrics_port, log_config=None, log_level=None\n'
+                       '        )\n')
+              only_logging = only_logging and previous.count(before) == 1 and Path('app/main.py').read_text() == previous.replace(before, after)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print('logging_only=' + str(only_logging).lower(), file=output)
               print('targets=' + json.dumps(['runtime'] if only_logging else ['runtime', 'worker']), file=output)
@@ -61,7 +71,10 @@ jobs:
       - run: uv run ruff check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
       - run: uv run ruff format --check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
       - run: uv run ty check app/core/runtime_logging.py
-      - run: uv run pytest tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py -q
+      - run: uv run ruff check app/main.py tests/unit/test_metrics_server_logging.py
+      - run: uv run ruff format --check app/main.py tests/unit/test_metrics_server_logging.py
+      - run: uv run ty check app/main.py
+      - run: uv run pytest tests/unit/test_metrics_server_logging.py tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py -q
       - if: steps.scope.outputs.logging_only != 'true'
         run: uv run ruff check app/core/utils/sse.py tests/unit/test_sse.py
       - if: steps.scope.outputs.logging_only != 'true'
@@ -120,7 +133,7 @@ jobs:
         env:
           LOGGING_ONLY: ${{ needs.verify.outputs.logging_only }}
         run: |
-          tests='tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py'
+          tests='tests/unit/test_metrics_server_logging.py tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py'
           if [[ "$LOGGING_ONLY" != 'true' ]]; then
             tests="$tests tests/unit/test_sse.py tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py"
           fi
@@ -144,8 +157,8 @@ jobs:
           baseline = json.loads(Path('/tmp/baseline-source.json').read_text())
           candidate = json.loads(Path('/tmp/candidate-source.json').read_text())
           changed = {p for p in baseline.keys() | candidate.keys() if baseline.get(p) != candidate.get(p)}
-          assert changed == {'core/utils/sse.py', 'core/runtime_logging.py'}, changed
-          print('All production Python sources preserved except the reviewed SSE cleanup and access logging fixes')
+          assert changed == {'core/utils/sse.py', 'core/runtime_logging.py', 'main.py'}, changed
+          print('All production Python sources preserved except the reviewed SSE, access formatter and metrics logging fixes')
           PY
       - name: Enforce preserved image high-severity gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
