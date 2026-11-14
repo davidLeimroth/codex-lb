@@ -1,12 +1,18 @@
 # Preserve the verified native-thread fixes already running in this cluster.
 FROM ghcr.io/davidleimroth/talos/codex-lb@sha256:6c3a557e326d5b761723d7f26c9b298977125996491a44e83a26b20460cf4f82 AS runtime
 USER root
+COPY uv.lock /tmp/runtime-security.lock
+RUN /opt/venv/bin/python -c \
+    'import pathlib,tomllib; p=next(p for p in tomllib.loads(pathlib.Path("/tmp/runtime-security.lock").read_text())["package"] if p["name"]=="dnspython"); pathlib.Path("/tmp/runtime-security.txt").write_text("dnspython=="+p["version"]+" --hash="+p["wheels"][0]["hash"]+"\n")'
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --only-upgrade zlib1g \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade zlib1g \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' zlib1g)" ge '1:1.3.dfsg+really1.3.1-1+deb13u1' \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m ensurepip \
-    && python -m pip install --no-cache-dir dnspython==2.9.2 \
-    && python -m pip uninstall -y pip
+    && /opt/venv/bin/python -m ensurepip \
+    && /opt/venv/bin/python -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes -r /tmp/runtime-security.txt \
+    && /opt/venv/bin/python -m pip uninstall -y pip \
+    && /opt/venv/bin/python -c 'import importlib.metadata as m; assert m.version("dnspython")=="2.9.2"' \
+    && rm /tmp/runtime-security.lock /tmp/runtime-security.txt
 USER app
 COPY --chown=app:app patches/claude-source-stream-errors.patch /tmp/claude-source-stream-errors.patch
 COPY --chown=app:app patches/http-bridge-transport-policy.patch /tmp/http-bridge-transport-policy.patch

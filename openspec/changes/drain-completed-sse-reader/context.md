@@ -16,3 +16,18 @@ or change reservation settlement. Existing cancellation handling is retained.
 
 The production image preserves native-thread patches. Deliver this fix with a
 separate exact-context patch rather than replacing the proxy service modules.
+
+Release checks also found fixed HIGH CVEs in zlib1g and dnspython. The standard
+image adds zlib1g to its existing named security upgrades and locks dnspython to
+2.9.2. The preserved runtime upgrades only those two dependencies, verifies the
+Debian fixed-version minimum, installs the wheel by the uv.lock hash into the
+explicit /opt/venv interpreter, removes pip and restores USER app. The 590-file
+application-source comparison excludes site-packages intentionally.
+
+Production promotion remains held. Talos policy at da7423e83cd1ebf27004de1b7f3de35d737ad11c
+requires codex-lb's isolated PostgreSQL/volume restore, migration, login, protocol
+and telemetry qualification. The fixed recipe registry does not register codex-lb
+and the stateful executor refuses it. Source/image regression results are not
+staging qualification. Complete the reviewed stateful qualification recipe and
+its isolated run before a reviewed image-only GitOps promotion. No production,
+storage, routing credentials, billing settings or network policies were mutated.
