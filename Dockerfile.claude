@@ -32,13 +32,15 @@ COPY --chown=app:app patches/http-bridge-transport-policy.patch /tmp/http-bridge
 COPY --chown=app:app patches/codex-capacity.patch /tmp/codex-capacity.patch
 COPY --chown=app:app patches/sse-reader-cleanup.patch /tmp/sse-reader-cleanup.patch
 COPY --chown=app:app patches/json-access-native-fields.patch /tmp/json-access-native-fields.patch
+COPY --chown=app:app patches/metrics-server-logging.patch /tmp/metrics-server-logging.patch
 COPY --chown=app:app scripts/apply-claude-runtime-patch.py /tmp/apply-claude-runtime-patch.py
 RUN python /tmp/apply-claude-runtime-patch.py \
     && python /tmp/apply-claude-runtime-patch.py /tmp/http-bridge-transport-policy.patch \
     && python /tmp/apply-claude-runtime-patch.py /tmp/codex-capacity.patch \
     && python /tmp/apply-claude-runtime-patch.py /tmp/sse-reader-cleanup.patch \
     && python /tmp/apply-claude-runtime-patch.py /tmp/json-access-native-fields.patch \
-    && rm /tmp/claude-source-stream-errors.patch /tmp/http-bridge-transport-policy.patch /tmp/codex-capacity.patch /tmp/sse-reader-cleanup.patch /tmp/json-access-native-fields.patch /tmp/apply-claude-runtime-patch.py
+    && python /tmp/apply-claude-runtime-patch.py /tmp/metrics-server-logging.patch \
+    && rm /tmp/claude-source-stream-errors.patch /tmp/http-bridge-transport-policy.patch /tmp/codex-capacity.patch /tmp/sse-reader-cleanup.patch /tmp/json-access-native-fields.patch /tmp/metrics-server-logging.patch /tmp/apply-claude-runtime-patch.py
 COPY --chown=app:app app/modules/claude_messages /app/app/modules/claude_messages
 COPY --chown=app:app app/claude_entrypoint.py /app/app/claude_entrypoint.py
 COPY --chmod=755 scripts/claude-entrypoint.sh /app/scripts/claude-entrypoint.sh

@@ -1,0 +1,5 @@
+- [x] Reproduce the shared logger mutation with a native two-server HTTP regression.
+- [x] Preserve primary logger configuration while starting native metrics.
+- [ ] Apply an exact-context runtime patch and preserve all other production sources.
+- [ ] Pass focused regressions, review, required checks and one runtime publication.
+- [ ] Complete the admitted synthetic image smoke, GitOps promotion and real subscription client verification.
