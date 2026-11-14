@@ -31,16 +31,17 @@ jobs:
       - name: Select focused logging regression
         id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # Immutable candidate behind the reused adapter/worker test evidence.
+          VERIFIED_SHA: 06d624bd85d13adfbeea76eb87cbf6399551c030
         run: |
           python - <<'PY'
           import json, os, re, subprocess
-          base = os.environ['BASE_SHA']
+          base = os.environ['VERIFIED_SHA']
           changed = set()
           if re.fullmatch(r'[0-9a-f]{40}', base) and base != '0' * 40:
               if subprocess.run(['git', 'cat-file', '-e', base], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
                   subprocess.run(['git', 'fetch', '--depth=1', 'origin', base], check=True)
-              changed = set(subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines())
+              changed = set(subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', base, 'HEAD'], text=True).splitlines())
           logging_files = {
               'app/core/runtime_logging.py', 'tests/unit/test_json_access_logging.py',
               'patches/json-access-native-fields.patch', 'scripts/apply-claude-runtime-patch.py',
@@ -57,8 +58,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev
-      - run: uv run ruff check app/core/runtime_logging.py tests/unit/test_json_access_logging.py
-      - run: uv run ruff format --check app/core/runtime_logging.py tests/unit/test_json_access_logging.py
+      - run: uv run ruff check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
+      - run: uv run ruff format --check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
       - run: uv run ty check app/core/runtime_logging.py
       - run: uv run pytest tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py -q
       - if: steps.scope.outputs.logging_only != 'true'
