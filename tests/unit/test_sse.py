@@ -178,21 +178,22 @@ async def test_inject_sse_keepalives_drains_completed_reader_on_close(upstream_e
 
 
 @pytest.mark.asyncio
-async def test_inject_sse_keepalives_preserves_upstream_error_after_heartbeat():
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+async def test_inject_sse_keepalives_preserves_upstream_error_after_heartbeat(error_type: type[Exception]):
     release = asyncio.Event()
     finished = asyncio.Event()
 
     async def source() -> AsyncIterator[str]:
         await release.wait()
         finished.set()
-        raise RuntimeError("upstream failure")
+        raise error_type("upstream failure")
         yield "unreachable"  # pragma: no cover
 
     stream = inject_sse_keepalives(source(), 0.01)
     assert await anext(stream) == SSE_KEEPALIVE_FRAME
     release.set()
     await asyncio.wait_for(finished.wait(), timeout=1)
-    with pytest.raises(RuntimeError, match="upstream failure"):
+    with pytest.raises(error_type, match="upstream failure"):
         await anext(stream)
 
 
