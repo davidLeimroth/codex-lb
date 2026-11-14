@@ -1,0 +1,61 @@
+diff --git a/app/core/runtime_logging.py b/app/core/runtime_logging.py
+index f5911e1b..74de94ad 100644
+--- a/app/core/runtime_logging.py
++++ b/app/core/runtime_logging.py
+@@ -130,16 +130,53 @@ class JsonFormatter(logging.Formatter):
+         return json.dumps(log_entry, default=str)
+ 
+ 
++_QUERY_IN_REQUEST_LINE = re.compile(r"\?.*?(?=\sHTTP/\d+(?:\.\d+)?\Z|\Z)", re.DOTALL)
++
++
++def _native_access_fields(args: object) -> tuple[str, str, int] | None:
++    if not isinstance(args, tuple) or len(args) != 5:
++        return None
++    client, method, target, version, status = args
++    if not (
++        isinstance(client, str)
++        and isinstance(method, str)
++        and isinstance(target, str)
++        and isinstance(version, str)
++        and isinstance(status, int)
++        and not isinstance(status, bool)
++        and 100 <= status <= 599
++    ):
++        return None
++    path = target.partition("?")[0]
++    if not (method and path and version):
++        return None
++    return client, f"{method} {path} HTTP/{version}", int(status)
++
++
+ class JsonAccessFormatter(logging.Formatter):
+     def format(self, record: logging.LogRecord) -> str:
++        client: JsonValue = None
++        request: JsonValue = None
++        status: JsonValue = None
++        native = _native_access_fields(record.args)
++        if native is not None:
++            client, request, status = native
++        attrs = vars(record)
++        if "client_addr" in attrs:
++            client = attrs["client_addr"]
++        if "request_line" in attrs:
++            request_line = attrs["request_line"]
++            request = _QUERY_IN_REQUEST_LINE.sub("", request_line, count=1) if isinstance(request_line, str) else None
++        if "status_code" in attrs:
++            status = attrs["status_code"]
+         log_entry: dict[str, JsonValue] = {
+             "timestamp": datetime.fromtimestamp(record.created, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+             "level": record.levelname,
+             "logger": record.name,
+             "type": "access",
+-            "client": getattr(record, "client_addr", None),
+-            "request": getattr(record, "request_line", None),
+-            "status": getattr(record, "status_code", None),
++            "client": client,
++            "request": request,
++            "status": status,
+         }
+         return json.dumps(log_entry, default=str)
+ 

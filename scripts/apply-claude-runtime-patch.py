@@ -13,6 +13,7 @@ patch = (
 )
 index = 0
 allowed = {
+    "app/core/runtime_logging.py",
     "app/core/utils/sse.py",
     "app/modules/proxy/helpers.py",
     "app/modules/model_sources/forwarding.py",

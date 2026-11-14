@@ -13,6 +13,9 @@ permissions:
   packages: write
 jobs:
   verify:
+    outputs:
+      logging_only: ${{ steps.scope.outputs.logging_only }}
+      targets: ${{ steps.scope.outputs.targets }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,27 +27,71 @@ jobs:
           git apply --reverse --check patches/http-bridge-transport-policy.patch
           git apply --reverse --check patches/codex-capacity.patch
           git apply --reverse --check patches/sse-reader-cleanup.patch
+          git apply --reverse --check patches/json-access-native-fields.patch
+      - name: Select focused logging regression
+        id: scope
+        env:
+          # Immutable candidate behind the reused adapter/worker test evidence.
+          VERIFIED_SHA: 06d624bd85d13adfbeea76eb87cbf6399551c030
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess
+          base = os.environ['VERIFIED_SHA']
+          changed = set()
+          if re.fullmatch(r'[0-9a-f]{40}', base) and base != '0' * 40:
+              if subprocess.run(['git', 'cat-file', '-e', base], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                  subprocess.run(['git', 'fetch', '--depth=1', 'origin', base], check=True)
+              changed = set(subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', base, 'HEAD'], text=True).splitlines())
+          logging_files = {
+              'app/core/runtime_logging.py', 'tests/unit/test_json_access_logging.py',
+              'patches/json-access-native-fields.patch', 'scripts/apply-claude-runtime-patch.py',
+              'Dockerfile.claude', '.github/workflows/claude-pool.yml', '.github/workflows/ci.yml',
+          }
+          only_logging = bool(changed) and all(
+              p in logging_files or p.startswith('openspec/changes/fix-native-json-access/') for p in changed
+          )
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('logging_only=' + str(only_logging).lower(), file=output)
+              print('targets=' + json.dumps(['runtime'] if only_logging else ['runtime', 'worker']), file=output)
+          PY
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev
-      - run: uv run ruff check app/core/utils/sse.py tests/unit/test_sse.py
-      - run: uv run ruff format --check app/core/utils/sse.py tests/unit/test_sse.py
-      - run: uv run ty check app/core/utils/sse.py
-      - run: uv run pytest tests/unit/test_sse.py -q
-      - run: uv run ruff check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
-      - run: uv run ruff format --check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
-      - run: uv run ty check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py
-      - run: uv run pytest tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_proxy_responses.py tests/unit/test_http_bridge_safe_continuity.py -q
-      - run: uv run ruff check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py
-      - run: uv run ty check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py
-      - run: uv run pytest tests/integration/test_model_source_routing.py tests/integration/test_proxy_chat_completions.py tests/unit/test_model_sources_forwarding.py tests/unit/test_model_sources_service.py tests/unit/test_model_sources_catalog.py tests/unit/test_proxy_websocket_model_source_guard.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py -q
+      - run: uv run ruff check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
+      - run: uv run ruff format --check app/core/runtime_logging.py tests/unit/test_json_access_logging.py scripts/apply-claude-runtime-patch.py
+      - run: uv run ty check app/core/runtime_logging.py
+      - run: uv run pytest tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py -q
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ruff check app/core/utils/sse.py tests/unit/test_sse.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ruff format --check app/core/utils/sse.py tests/unit/test_sse.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ty check app/core/utils/sse.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run pytest tests/unit/test_sse.py -q
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ruff check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ruff format --check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py tests/integration/test_http_bridge_transport_pin.py tests/unit/test_http_bridge_transport_pin.py scripts/apply-claude-runtime-patch.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ty check app/modules/proxy/_service/http_bridge/streaming.py app/modules/proxy/_service/streaming/retry.py app/modules/proxy/_service/support.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run pytest tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_proxy_responses.py tests/unit/test_http_bridge_safe_continuity.py -q
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ruff check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run ty check app/modules/claude_cli app/modules/claude_messages app/claude_entrypoint.py
+      - if: steps.scope.outputs.logging_only != 'true'
+        run: uv run pytest tests/integration/test_model_source_routing.py tests/integration/test_proxy_chat_completions.py tests/unit/test_model_sources_forwarding.py tests/unit/test_model_sources_service.py tests/unit/test_model_sources_catalog.py tests/unit/test_proxy_websocket_model_source_guard.py tests/unit/test_claude_cli_bridge.py tests/integration/test_claude_messages.py -q
   images:
+    # Build and publish the exact reviewed merge once, after source checks.
+    if: github.event_name != 'pull_request'
     needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [runtime, worker]
+        target: ${{ fromJSON(needs.verify.outputs.targets) }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -68,15 +115,21 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/davidLeimroth/codex-lb
             org.opencontainers.image.revision=${{ github.sha }}
-      - name: Verify adapter inside pinned runtime
+      - name: Verify focused behavior inside pinned runtime
         if: matrix.target == 'runtime'
+        env:
+          LOGGING_ONLY: ${{ needs.verify.outputs.logging_only }}
         run: |
-          docker run --rm --user 0 --entrypoint sh \
+          tests='tests/unit/test_json_access_logging.py tests/unit/test_structured_logging.py'
+          if [[ "$LOGGING_ONLY" != 'true' ]]; then
+            tests="$tests tests/unit/test_sse.py tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py"
+          fi
+          docker run --rm --user 0 --entrypoint sh -e TEST_TARGETS="$tests" \
             -v "$PWD/tests:/tmp/check/tests:ro" \
             -v "$PWD/pyproject.toml:/tmp/check/pyproject.toml:ro" \
             -w /tmp/check \
             ghcr.io/davidleimroth/codex-lb:claude-runtime-${{ github.sha }} \
-            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest tests/unit/test_sse.py tests/unit/test_http_bridge_transport_pin.py tests/integration/test_http_bridge_transport_pin.py tests/integration/test_model_source_routing.py tests/unit/test_model_sources_forwarding.py tests/integration/test_claude_messages.py -q'
+            -c 'python -m ensurepip && python -m pip install pytest pytest-asyncio pytest-timeout httpx openai hypothesis && PYTHONPATH=/app:/tmp/check python -m pytest $TEST_TARGETS -q'
       - name: Verify production source preservation
         if: matrix.target == 'runtime'
         run: |
@@ -91,8 +144,8 @@ jobs:
           baseline = json.loads(Path('/tmp/baseline-source.json').read_text())
           candidate = json.loads(Path('/tmp/candidate-source.json').read_text())
           changed = {p for p in baseline.keys() | candidate.keys() if baseline.get(p) != candidate.get(p)}
-          assert changed == {'core/utils/sse.py'}, changed
-          print('All production Python sources preserved except the reviewed SSE cleanup fix')
+          assert changed == {'core/utils/sse.py', 'core/runtime_logging.py'}, changed
+          print('All production Python sources preserved except the reviewed SSE cleanup and access logging fixes')
           PY
       - name: Enforce preserved image high-severity gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
@@ -117,3 +170,22 @@ jobs:
           digest="$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' /tmp/push.log | tail -n1)"
           test -n "$digest" || { echo "::error::no digest in push output"; exit 1; }
           echo "${{ matrix.target }} $digest" >> "$GITHUB_STEP_SUMMARY"
+
+  required:
+    name: CI Required
+    if: always()
+    needs: [verify, images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require source checks and the applicable image gate
+        env:
+          VERIFY: ${{ needs.verify.result }}
+          IMAGES: ${{ needs.images.result }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          test "$VERIFY" = success
+          if [[ "$EVENT" = pull_request ]]; then
+            test "$IMAGES" = skipped
+          else
+            test "$IMAGES" = success
+          fi
